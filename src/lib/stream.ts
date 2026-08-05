@@ -31,12 +31,110 @@ const FALLBACK_STREAM = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
 const env = (import.meta as unknown as { env?: Record<string, string> }).env ?? {};
 
 /**
- * Resolver URL pinned at build time by Vite (any `VITE_*` variable is
- * inlined). When undefined we fall through to the same-origin
- * `/api/stream` edge function.
+ * Raw value of `VITE_STREAM_RESOLVER_URL` from `.env`. May be:
+ *   - empty string (unset)
+ *   - a fully-qualified URL: `https://your-host.example/api/stream`
+ *   - a URL with a `?url=...` *inside* a `(...)` wrapper, in cases
+ *     where the operator pasted it from a "copy link" UI
+ *   - a path-relative URL: `/api/stream`
+ *
+ * The raw value is sanitised by `normalizeResolverUrl()` below before
+ * being used in a fetch.
  */
-const VITE_STREAM_RESOLVER_URL: string =
-  (env.VITE_STREAM_RESOLVER_URL ?? "").trim();
+const RAW_STREAM_RESOLVER_URL: string =
+  (env.VITE_STREAM_RESOLVER_URL ?? "").toString();
+
+/* ───────────────────────────  URL sanitiser  ─────────────────────────── */
+
+/**
+ * Clean up the operator-supplied resolver URL so it can be safely
+ * composed with query params.
+ *
+ * Handles the common `.env` mistakes we've seen:
+ *   - Surrounding whitespace and `"…"` / `'…'` quotes.
+ *   - A trailing `?` left over from a partial paste.
+ *   - A wrapping `(…)` around the *entire* URL — e.g.
+ *       `https://outer.com(?url=https://inner.com)` → strips the
+ *       parens, keeps both URLs concatenated with `?` between them.
+ *   - Multiple stray `?` separators at the start of the path.
+ *   - Trailing `&` or `?` characters.
+ *
+ * Returns `null` when the result would otherwise be an unusable URL
+ * (e.g. all-parens garbage, no scheme/path). Callers treat `null` as
+ * "fall back to same-origin /api/stream."
+ *
+ * This is *string-level* cleanup only. It does not whitelist
+ * destinations, validate schemes against an allowlist, or change the
+ * meaning of an intentional nested URL. The destination URL is the
+ * operator's responsibility.
+ */
+export function normalizeResolverUrl(raw: string): string | null {
+  if (typeof raw !== "string") return null;
+  let s = raw.trim();
+  if (s.length === 0) return null;
+
+  // Strip a single pair of wrapping quotes some `.env` parsers keep.
+  // We only peel one layer so URLs containing legitimate `"` survive.
+  if (
+    (s.startsWith('"') && s.endsWith('"')) ||
+    (s.startsWith("'") && s.endsWith("'"))
+  ) {
+    s = s.slice(1, -1).trim();
+  }
+
+  // Strip a wrapping `(…)` pair around the *entire* URL, but only when
+  // the open paren is followed immediately by what looks like a scheme
+  // and the closing paren is at the end of the string. This protects
+  // against pasted wrappers like:
+  //   `https://outer.com(?url=https://inner.com)`
+  // Becomes:
+  //   `https://outer.com?url=https://inner.com`
+  const wrapMatch = /^(\s*)?\((https?:\/\/[^\s)]+)\)(\s*)?$/.exec(s);
+  if (wrapMatch) {
+    s = wrapMatch[2];
+  } else {
+    // Some operators paste without inner scheme, e.g.
+    //   `(https://outer.com/api/stream)`. Strip a bare `(…)` wrapper.
+    if (s.startsWith("(") && s.endsWith(")")) {
+      s = s.slice(1, -1).trim();
+    }
+  }
+
+  // Collapse "??" / "?&" / "&&" run-on into a single `?` followed by a
+  // single `&`. Only acts on the boundary between path and query,
+  // preserving query-internal separators.
+  s = s.replace(/[?&]{2,}/g, (m) => (m[0] === "?" ? "?" : "&"));
+
+  // Remove any trailing `?` or `&` so we can safely append our own
+  // params below without producing `?&` or `??` sequences.
+  s = s.replace(/[?&]+$/, "");
+
+  // Require at least a scheme or a single-leading-slash path. Anything
+  // else is unusable.
+  if (!/^(https?:\/\/|\/)/i.test(s)) return null;
+
+  return s;
+}
+
+const NORMALIZED_STREAM_RESOLVER_URL: string | null = normalizeResolverUrl(
+  RAW_STREAM_RESOLVER_URL,
+);
+
+if (
+  typeof window !== "undefined" &&
+  RAW_STREAM_RESOLVER_URL &&
+  NORMALIZED_STREAM_RESOLVER_URL !== RAW_STREAM_RESOLVER_URL.trim()
+) {
+  // Surface the cleanup once per page load so misconfigured
+  // `.env` values don't produce silent fetch failures. We log the
+  // cleaned form (not the raw) — the raw value is the operator's
+  // own input and may contain credentials.
+  console.warn(
+    "[stream] normalized VITE_STREAM_RESOLVER_URL — paste whitespace, quotes, or wrapper parens were stripped",
+  );
+}
+
+/* ───────────────────────────  Public types  ─────────────────────────── */
 
 export interface StreamParams {
   tmdbId: number;
@@ -62,6 +160,28 @@ function pickStreamUrl(data: ResolverResponse | null): string | null {
 }
 
 /**
+ * Compose the resolver endpoint URL from a sanitised base + the four
+ * media params. Returns `null` if the base is unusable.
+ */
+function buildEndpoint(
+  base: string,
+  params: { tmdbId: number; mediaType: MediaType; season: number; episode: number },
+): string | null {
+  const normalized = normalizeResolverUrl(base);
+  if (!normalized) return null;
+  const query = new URLSearchParams({
+    tmdbId: String(params.tmdbId),
+    type: params.mediaType,
+    season: String(params.season),
+    episode: String(params.episode),
+  }).toString();
+  const separator = normalized.includes("?") ? "&" : "?";
+  return `${normalized}${separator}${query}`;
+}
+
+/* ───────────────────────────  Public API  ─────────────────────────── */
+
+/**
  * Resolve the direct HLS manifest URL for a given title. Always
  * returns a non-empty string — callers can pass the result directly to
  * `<VideoPlayer streamUrl=...>` without null-checking.
@@ -83,24 +203,22 @@ export async function fetchDirectStreamUrl({
   //    shows a "no media" overlay above the player during this.
   if (!tmdbId) return FALLBACK_STREAM;
 
-  const query = new URLSearchParams({
-    tmdbId: String(tmdbId),
-    type: mediaType,
-    season: String(season),
-    episode: String(episode),
-  }).toString();
-
   // Pick the resolver base. The dev URL (set via VITE_STREAM_RESOLVER_URL)
   // wins when present so local dev doesn't need a Vercel deployment.
-  const baseUrl = VITE_STREAM_RESOLVER_URL || "/api/stream";
-  const separator = baseUrl.includes("?") ? "&" : "?";
-  const endpoint = `${baseUrl}${separator}${query}`;
+  // The fallback when nothing usable is configured is the same-origin
+  // edge function at `/api/stream`.
+  const base = NORMALIZED_STREAM_RESOLVER_URL ?? "/api/stream";
+  const endpoint = buildEndpoint(base, { tmdbId, mediaType, season, episode });
+  if (!endpoint) {
+    console.warn("[stream] resolver URL could not be normalized, using fallback");
+    return FALLBACK_STREAM;
+  }
 
   try {
     const response = await fetch(endpoint);
     if (!response.ok) {
       console.warn(
-        `[stream] resolver ${endpoint} returned ${response.status}, using fallback`,
+        `[stream] resolver returned ${response.status}, using fallback`,
       );
       return FALLBACK_STREAM;
     }
@@ -114,3 +232,10 @@ export async function fetchDirectStreamUrl({
     return FALLBACK_STREAM;
   }
 }
+
+/** Exposed for unit testing. */
+export const __test__ = {
+  buildEndpoint,
+  normalizeResolverUrl,
+  FALLBACK_STREAM,
+};
