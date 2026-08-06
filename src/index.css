@@ -150,3 +150,66 @@ body {
 .pulse-dot {
   animation: pulseDot 2s ease-out infinite;
 }
+
+/* ──────────── Player container queries + fullscreen ──────────── */
+
+/* The wrap becomes a self-contained layout context. Container queries
+   fire from the player's actual width, not the viewport — so the
+   responsive behavior is correct when the player is shrunk inside a
+   sidebar or stretched across a fullscreen viewport. */
+.video-player-wrap {
+  container-type: inline-size;
+  container-name: player;
+}
+
+/* Below 640px (in player-local units), shrink the controls and pad
+   to respect the device safe-area so iOS home-indicator / Android
+   gesture bar don't overlap the play button. */
+@container player (max-width: 640px) {
+  .video-controls {
+    padding-bottom: calc(0.6rem + env(safe-area-inset-bottom, 0px));
+  }
+  .video-controls button {
+    transform: scale(0.95);
+  }
+}
+
+/* Fullscreen — both vendor-prefixed for Safari. The wrapper is the
+   fullscreen element, so the iframe / video inside cleanly fills the
+   viewport instead of the page. Layout doesn't break because the
+   wrapper itself is the scope. */
+.video-player-wrap:fullscreen,
+.video-player-wrap:-webkit-full-screen {
+  background: #000;
+  width: 100vw;
+  height: 100vh;
+  display: grid;
+  place-items: center;
+}
+
+.video-player-wrap:fullscreen > iframe,
+.video-player-wrap:fullscreen > video,
+.video-player-wrap:-webkit-full-screen > iframe,
+.video-player-wrap:-webkit-full-screen > video {
+  width: 100%;
+  height: 100%;
+  max-height: 100vh;
+  object-fit: contain;
+}
+
+/* When fullscreen, keep the controls visible (otherwise they fade
+   out quickly and the user can't exit). */
+.video-player-wrap[data-fs="true"] .video-controls {
+  opacity: 1 !important;
+}
+
+/* Subtitles — override the default tiny centered styling so Arabic
+   text is readable on both dark and light backgrounds. */
+.video-player-wrap video::cue {
+  background: rgba(0, 0, 0, 0.75);
+  color: #fff;
+  font-size: clamp(14px, 2.4cqw, 28px);
+  line-height: 1.35;
+  border-radius: 4px;
+  padding: 0 0.25em;
+}

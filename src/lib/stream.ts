@@ -1,20 +1,22 @@
 /**
  * Client-side stream resolver.
  *
- * Resolves a direct HLS (`.m3u8`) URL for `<VideoPlayer streamUrl=…>`
- * in three layers, from highest to lowest priority:
+ * Resolves the list of embed servers for `<VideoPlayer />` in three
+ * layers, from highest to lowest priority:
  *
  *   1. `customStreamUrl` (from room state). Short-circuits — no fetch.
+ *      The URL is wrapped as a single HLS server at index 0.
  *   2. `VITE_STREAM_RESOLVER_URL` if set. Lets the operator point at a
  *      local dev endpoint (e.g. `http://localhost:3000/api/stream`)
  *      without needing to spin up Vercel locally.
- *   3. Same-origin `/api/stream`. The Vercel edge function reads
+ *   3. Same-origin `/api/servers`. The Vercel edge function reads
  *      `STREAM_RESOLVER_URL` (server-side) to forward to a real
- *      upstream. This is the production-correct path.
+ *      upstream, and returns the full 6-server catalog.
  *
- * Fallback: Mux's public test stream. Returned whenever the resolver
- * is missing, errors, or returns a malformed response, so the player
- * never receives an empty `streamUrl`.
+ * On any failure (network, missing resolver, 404, malformed
+ * response) the function returns an empty array so the player can
+ * surface an honest "no stream configured" state. There is no
+ * client-side fallback stream.
  *
  * This module does NOT reference or route to any third-party proxy
  * domain. Operators configure their own resolver via the env vars.
@@ -22,59 +24,18 @@
 
 import type { MediaType } from "../data/catalog";
 
-/** Public Mux test stream — used as the absolute-last-resort fallback. */
-const FALLBACK_STREAM = "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
-
-// `import.meta.env` is Vite's typed env accessor. We avoid importing
-// `vite/client` types and instead declare the shape we use, so this
-// file stays self-contained.
 const env = (import.meta as unknown as { env?: Record<string, string> }).env ?? {};
 
-/**
- * Raw value of `VITE_STREAM_RESOLVER_URL` from `.env`. May be:
- *   - empty string (unset)
- *   - a fully-qualified URL: `https://your-host.example/api/stream`
- *   - a URL with a `?url=...` *inside* a `(...)` wrapper, in cases
- *     where the operator pasted it from a "copy link" UI
- *   - a path-relative URL: `/api/stream`
- *
- * The raw value is sanitised by `normalizeResolverUrl()` below before
- * being used in a fetch.
- */
 const RAW_STREAM_RESOLVER_URL: string =
   (env.VITE_STREAM_RESOLVER_URL ?? "").toString();
 
 /* ───────────────────────────  URL sanitiser  ─────────────────────────── */
 
-/**
- * Clean up the operator-supplied resolver URL so it can be safely
- * composed with query params.
- *
- * Handles the common `.env` mistakes we've seen:
- *   - Surrounding whitespace and `"…"` / `'…'` quotes.
- *   - A trailing `?` left over from a partial paste.
- *   - A wrapping `(…)` around the *entire* URL — e.g.
- *       `https://outer.com(?url=https://inner.com)` → strips the
- *       parens, keeps both URLs concatenated with `?` between them.
- *   - Multiple stray `?` separators at the start of the path.
- *   - Trailing `&` or `?` characters.
- *
- * Returns `null` when the result would otherwise be an unusable URL
- * (e.g. all-parens garbage, no scheme/path). Callers treat `null` as
- * "fall back to same-origin /api/stream."
- *
- * This is *string-level* cleanup only. It does not whitelist
- * destinations, validate schemes against an allowlist, or change the
- * meaning of an intentional nested URL. The destination URL is the
- * operator's responsibility.
- */
 export function normalizeResolverUrl(raw: string): string | null {
   if (typeof raw !== "string") return null;
   let s = raw.trim();
   if (s.length === 0) return null;
 
-  // Strip a single pair of wrapping quotes some `.env` parsers keep.
-  // We only peel one layer so URLs containing legitimate `"` survive.
   if (
     (s.startsWith('"') && s.endsWith('"')) ||
     (s.startsWith("'") && s.endsWith("'"))
@@ -82,35 +43,18 @@ export function normalizeResolverUrl(raw: string): string | null {
     s = s.slice(1, -1).trim();
   }
 
-  // Strip a wrapping `(…)` pair around the *entire* URL, but only when
-  // the open paren is followed immediately by what looks like a scheme
-  // and the closing paren is at the end of the string. This protects
-  // against pasted wrappers like:
-  //   `https://outer.com(?url=https://inner.com)`
-  // Becomes:
-  //   `https://outer.com?url=https://inner.com`
   const wrapMatch = /^(\s*)?\((https?:\/\/[^\s)]+)\)(\s*)?$/.exec(s);
   if (wrapMatch) {
     s = wrapMatch[2];
   } else {
-    // Some operators paste without inner scheme, e.g.
-    //   `(https://outer.com/api/stream)`. Strip a bare `(…)` wrapper.
     if (s.startsWith("(") && s.endsWith(")")) {
       s = s.slice(1, -1).trim();
     }
   }
 
-  // Collapse "??" / "?&" / "&&" run-on into a single `?` followed by a
-  // single `&`. Only acts on the boundary between path and query,
-  // preserving query-internal separators.
   s = s.replace(/[?&]{2,}/g, (m) => (m[0] === "?" ? "?" : "&"));
-
-  // Remove any trailing `?` or `&` so we can safely append our own
-  // params below without producing `?&` or `??` sequences.
   s = s.replace(/[?&]+$/, "");
 
-  // Require at least a scheme or a single-leading-slash path. Anything
-  // else is unusable.
   if (!/^(https?:\/\/|\/)/i.test(s)) return null;
 
   return s;
@@ -125,16 +69,23 @@ if (
   RAW_STREAM_RESOLVER_URL &&
   NORMALIZED_STREAM_RESOLVER_URL !== RAW_STREAM_RESOLVER_URL.trim()
 ) {
-  // Surface the cleanup once per page load so misconfigured
-  // `.env` values don't produce silent fetch failures. We log the
-  // cleaned form (not the raw) — the raw value is the operator's
-  // own input and may contain credentials.
   console.warn(
     "[stream] normalized VITE_STREAM_RESOLVER_URL — paste whitespace, quotes, or wrapper parens were stripped",
   );
 }
 
 /* ───────────────────────────  Public types  ─────────────────────────── */
+
+export interface EmbedServer {
+  index: number;
+  key: string;
+  label: string;
+  /** Short provider label, e.g. "Vidsrc". Shown on the switcher pill. */
+  provider: string;
+  kind: "hls" | "iframe";
+  url: string;
+  hasQuality: boolean;
+}
 
 export interface StreamParams {
   tmdbId: number;
@@ -145,97 +96,118 @@ export interface StreamParams {
   customStreamUrl?: string | null;
 }
 
-/** Shape returned by the resolver. Accepts both `streamUrl` and `url`. */
-interface ResolverResponse {
+/** Server-list response shape from `/api/servers` or `/api/stream`. */
+interface ServerListResponse {
   success?: boolean;
+  servers?: EmbedServer[];
   streamUrl?: string;
-  url?: string;
-}
-
-/** Pick the manifest URL from a resolver response, or return `null`. */
-function pickStreamUrl(data: ResolverResponse | null): string | null {
-  if (!data || typeof data !== "object") return null;
-  const raw = data.streamUrl ?? data.url;
-  return typeof raw === "string" && raw.trim().length > 0 ? raw : null;
-}
-
-/**
- * Compose the resolver endpoint URL from a sanitised base + the four
- * media params. Returns `null` if the base is unusable.
- */
-function buildEndpoint(
-  base: string,
-  params: { tmdbId: number; mediaType: MediaType; season: number; episode: number },
-): string | null {
-  const normalized = normalizeResolverUrl(base);
-  if (!normalized) return null;
-  const query = new URLSearchParams({
-    tmdbId: String(params.tmdbId),
-    type: params.mediaType,
-    season: String(params.season),
-    episode: String(params.episode),
-  }).toString();
-  const separator = normalized.includes("?") ? "&" : "?";
-  return `${normalized}${separator}${query}`;
+  imdbId?: string | null;
+  error?: string;
 }
 
 /* ───────────────────────────  Public API  ─────────────────────────── */
 
 /**
- * Resolve the direct HLS manifest URL for a given title. Always
- * returns a non-empty string — callers can pass the result directly to
- * `<VideoPlayer streamUrl=...>` without null-checking.
+ * Resolve the 6-server catalog for a given title. Returns an empty
+ * array when there is nothing playable — callers should treat that
+ * as an honest "no stream configured" state.
  */
-export async function fetchDirectStreamUrl({
+export async function fetchEmbedServers({
   tmdbId,
   mediaType,
   season = 1,
   episode = 1,
   customStreamUrl,
-}: StreamParams): Promise<string> {
-  // 1. Host-provided URL — short-circuit, no fetch.
+}: StreamParams): Promise<EmbedServer[]> {
+  // 1. Host-provided URL — short-circuit, no fetch. Wrap as a single
+  //    HLS server at index 0 so the player treats it uniformly.
   if (customStreamUrl && customStreamUrl.trim().length > 0) {
-    return customStreamUrl;
+    return [
+      {
+        index: 0,
+        key: "custom",
+        label: "Server 1 — Custom stream",
+        provider: "Custom",
+        kind: "hls",
+        url: customStreamUrl,
+        hasQuality: true,
+      },
+    ];
   }
 
-  // 2. No title resolved yet — return the fallback so the player has
-  //    something to render while we wait on the host. The room UI
-  //    shows a "no media" overlay above the player during this.
-  if (!tmdbId) return FALLBACK_STREAM;
+  // 2. No title resolved yet — nothing to resolve against.
+  if (!tmdbId) return [];
 
-  // Pick the resolver base. The dev URL (set via VITE_STREAM_RESOLVER_URL)
-  // wins when present so local dev doesn't need a Vercel deployment.
-  // The fallback when nothing usable is configured is the same-origin
-  // edge function at `/api/stream`.
-  const base = NORMALIZED_STREAM_RESOLVER_URL ?? "/api/stream";
-  const endpoint = buildEndpoint(base, { tmdbId, mediaType, season, episode });
-  if (!endpoint) {
-    console.warn("[stream] resolver URL could not be normalized, using fallback");
-    return FALLBACK_STREAM;
-  }
+  const query = new URLSearchParams({
+    tmdbId: String(tmdbId),
+    type: mediaType,
+    season: String(season),
+    episode: String(episode),
+  }).toString();
 
-  try {
-    const response = await fetch(endpoint);
-    if (!response.ok) {
-      console.warn(
-        `[stream] resolver returned ${response.status}, using fallback`,
-      );
-      return FALLBACK_STREAM;
+  // 3. Try the developer-configured resolver first (so local dev
+  //    doesn't need a Vercel deploy). Then fall back to the same-origin
+  //    `/api/servers` endpoint.
+  const candidates = [
+    NORMALIZED_STREAM_RESOLVER_URL,
+    "/api/servers",
+  ].filter((u): u is string => Boolean(u));
+
+  for (const base of candidates) {
+    const separator = base.includes("?") ? "&" : "?";
+    const endpoint = `${base}${separator}${query}`;
+    try {
+      const response = await fetch(endpoint);
+      if (!response.ok) {
+        console.warn(`[stream] ${base} returned ${response.status}`);
+        continue;
+      }
+      const data = (await response.json()) as ServerListResponse;
+      const list = Array.isArray(data?.servers) ? data.servers : null;
+      if (list && list.length > 0) {
+        // Normalize — sort by index defensively in case the server returns
+        // a different order.
+        const sorted = [...list].sort((a, b) => a.index - b.index);
+        return sorted;
+      }
+      // Legacy shape: just a single streamUrl. Wrap it as a single HLS
+      // server so the player pipeline still works.
+      if (typeof data?.streamUrl === "string" && data.streamUrl.length > 0) {
+        return [
+          {
+            index: 0,
+            key: "premium-hls",
+            label: "Server 1 — Premium HLS",
+            provider: "HLS",
+            kind: "hls",
+            url: data.streamUrl,
+            hasQuality: true,
+          },
+        ];
+      }
+      console.warn(`[stream] ${base} response missing servers/streamUrl`);
+    } catch (err) {
+      console.warn(`[stream] ${base} fetch failed:`, err);
+      continue;
     }
-    const data = (await response.json()) as ResolverResponse;
-    const streamUrl = pickStreamUrl(data);
-    if (streamUrl) return streamUrl;
-    console.warn("[stream] resolver response missing streamUrl/url, using fallback");
-    return FALLBACK_STREAM;
-  } catch (err) {
-    console.warn("[stream] resolver fetch failed, using fallback:", err);
-    return FALLBACK_STREAM;
   }
+
+  return [];
+}
+
+/**
+ * Backward-compatible "give me the first HLS server" wrapper. Kept
+ * for callers that haven't migrated to the 6-server list yet.
+ */
+export async function fetchDirectStreamUrl(
+  params: StreamParams,
+): Promise<string | null> {
+  const servers = await fetchEmbedServers(params);
+  const hls = servers.find((s) => s.kind === "hls");
+  return hls?.url ?? null;
 }
 
 /** Exposed for unit testing. */
 export const __test__ = {
-  buildEndpoint,
   normalizeResolverUrl,
-  FALLBACK_STREAM,
 };

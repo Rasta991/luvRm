@@ -1,6 +1,7 @@
 import Hls from "hls.js";
 import {
   AlertTriangle,
+  Captions,
   ChevronDown,
   Loader2,
   Pause,
@@ -11,7 +12,14 @@ import {
   Volume2,
   VolumeX,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { EmbedServer } from "../lib/stream";
 import { cn } from "../utils/cn";
 
 export interface SubtitleTrack {
@@ -26,27 +34,33 @@ export interface SubtitleTrack {
 }
 
 export interface VideoPlayerProps {
-  /** HLS manifest URL. Must end in `.m3u8`. */
-  streamUrl?: string;
-  /** Poster image shown before the first frame. */
+  /**
+   * The embed server currently in use. Pass `null` to render the
+   * "no playable stream" placeholder.
+   *
+   * `kind: "hls"` → uses hls.js / native HLS for the manifest URL.
+   * `kind: "iframe"` → renders an iframe whose `src` is the embed URL.
+   */
+  server: EmbedServer | null;
+  /** Poster image shown before the first frame (HLS only). */
   poster?: string;
   /** Display title (used for aria). */
   title?: string;
-  /** External subtitle tracks to expose to the native <track> UI. */
+  /** External subtitle tracks. Only effective for `kind: "hls"`. */
   subtitles?: SubtitleTrack[];
   /** Autoplay when ready. Browsers may block this without a user gesture. */
   autoPlay?: boolean;
-  /** Show the in-player quality selector. Defaults to true when levels > 1. */
-  showQualityMenu?: boolean;
-  /** Show the in-player subtitle menu. Defaults to true when tracks > 0. */
-  showSubtitleMenu?: boolean;
   /** Force a fresh remount when this changes (e.g. when navigating episodes). */
   reloadKey?: string;
+  /**
+   * Reports iframe load events back to the parent so the server
+   * switcher can update its status dots. Only used for iframe servers.
+   */
+  onServerStatus?: (status: "loading" | "ok" | "failed") => void;
   className?: string;
 }
 
 interface QualityLevel {
-  /** hls.js level index, or -1 for auto. */
   index: number;
   width: number;
   height: number;
@@ -54,18 +68,12 @@ interface QualityLevel {
   label: string;
 }
 
-/** Public Mux test stream — multi-bitrate HLS, safe for development. */
-const DEFAULT_STREAM =
-  "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
-
-/** Format a bitrate (bits/s) as Mbps / kbps for the picker. */
 function formatBitrate(bitrate: number): string {
   if (!isFinite(bitrate) || bitrate <= 0) return "";
   if (bitrate >= 1_000_000) return `${(bitrate / 1_000_000).toFixed(2)} Mbps`;
   return `${Math.round(bitrate / 1_000)} kbps`;
 }
 
-/** Human-readable time string (mm:ss / h:mm:ss). */
 function fmt(t: number): string {
   if (!isFinite(t) || t < 0) return "00:00";
   const s = Math.floor(t % 60).toString().padStart(2, "0");
@@ -74,34 +82,43 @@ function fmt(t: number): string {
   return h > 0 ? `${h}:${m}:${s}` : `${m}:${s}`;
 }
 
-/** Build a display label for an hls.js level, e.g. "1080p · 5.20 Mbps". */
 function levelLabel(level: { width: number; height: number; bitrate: number }): string {
   const res = level.height ? `${level.height}p` : level.width ? `${level.width}w` : "";
   const br = formatBitrate(level.bitrate);
   return [res, br].filter(Boolean).join(" · ") || "Track";
 }
 
+const IFRAME_LOAD_TIMEOUT_MS = 8000;
+
 /**
- * Production HLS player built on `hls.js`.
+ * Production embed-aware player.
  *
- * - Native HLS (Safari/iOS) when available; MSE fallback everywhere else.
- * - External WebVTT/SubRip subtitle tracks via <track>.
- * - In-player quality picker driven by hls.js levels.
- * - Cleans up the Hls instance and all event listeners on unmount / reload.
+ * Renders one of two surfaces based on `server.kind`:
+ *
+ *   - `hls`    → hls.js for browsers that need it, native HLS for
+ *                Safari. Quality picked from real hls.js levels.
+ *   - `iframe` → just an iframe with the embed URL. We can't drive
+ *                the embed's internal quality from the outside, so
+ *                the quality menu is hidden for iframe servers.
+ *
+ * Fullscreen works for both surfaces: the wrapper is the fullscreen
+ * element, the iframe inside fills the wrapper, and the HLS video
+ * uses its native requestFullscreen API paired with the wrapper.
  */
 export function VideoPlayer({
-  streamUrl = DEFAULT_STREAM,
+  server,
   poster,
   title,
   subtitles = [],
   autoPlay = false,
-  showQualityMenu,
-  showSubtitleMenu,
   reloadKey,
+  onServerStatus,
   className,
 }: VideoPlayerProps) {
+  const wrapRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const loadTimerRef = useRef<number | null>(null);
 
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -111,16 +128,41 @@ export function VideoPlayer({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [levels, setLevels] = useState<QualityLevel[]>([]);
-  const [currentLevel, setCurrentLevel] = useState<number>(-1); // -1 = auto
+  const [currentLevel, setCurrentLevel] = useState<number>(-1);
   const [showSettings, setShowSettings] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"quality" | "subtitles">("quality");
   const [activeSubtitleLang, setActiveSubtitleLang] = useState<string | null>(() => {
     const def = subtitles.find((s) => s.default);
     return def?.lang ?? null;
   });
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
-  // -------- attach hls.js / native src -----------------------------------
+  const isIframe = server?.kind === "iframe";
+  const isHls = server?.kind === "hls";
+
+  // ───────── fullscreen wiring ──────────────────────────────────────────
   useEffect(() => {
+    const onFs = () => {
+      const fs =
+        document.fullscreenElement ||
+        (document as Document & { webkitFullscreenElement?: Element })
+          .webkitFullscreenElement;
+      setIsFullscreen(!!fs);
+    };
+    document.addEventListener("fullscreenchange", onFs);
+    document.addEventListener("webkitfullscreenchange", onFs as EventListener);
+    return () => {
+      document.removeEventListener("fullscreenchange", onFs);
+      document.removeEventListener(
+        "webkitfullscreenchange",
+        onFs as EventListener,
+      );
+    };
+  }, []);
+
+  // ───────── HLS attach ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (!isHls || !server) return;
     const video = videoRef.current;
     if (!video) return;
 
@@ -129,7 +171,6 @@ export function VideoPlayer({
     setLevels([]);
     setCurrentLevel(-1);
 
-    // Clean up any previous instance.
     if (hlsRef.current) {
       hlsRef.current.destroy();
       hlsRef.current = null;
@@ -138,11 +179,9 @@ export function VideoPlayer({
     const canNative = video.canPlayType("application/vnd.apple.mpegurl") !== "";
 
     if (canNative || !Hls.isSupported()) {
-      // Safari / iOS: hand the manifest directly to the <video>.
-      video.src = streamUrl;
+      video.src = server.url;
     } else {
       const hls = new Hls({
-        // Reasonable defaults for VOD; tweak as your CDN needs.
         enableWorker: true,
         lowLatencyMode: false,
         backBufferLength: 60,
@@ -173,7 +212,7 @@ export function VideoPlayer({
         setCurrentLevel(data.level);
       });
 
-      hls.loadSource(streamUrl);
+      hls.loadSource(server.url);
       hls.attachMedia(video);
     }
 
@@ -185,10 +224,38 @@ export function VideoPlayer({
       video.removeAttribute("src");
       video.load();
     };
-  }, [streamUrl, reloadKey]);
+  }, [server?.url, isHls, reloadKey]);
 
-  // -------- surface hls.js levels to React -------------------------------
+  // ───────── iframe load + timeout ──────────────────────────────────────
   useEffect(() => {
+    if (!isIframe || !server) return;
+    if (loadTimerRef.current) {
+      window.clearTimeout(loadTimerRef.current);
+      loadTimerRef.current = null;
+    }
+    onServerStatus?.("loading");
+    setIsLoading(true);
+    setError(null);
+    loadTimerRef.current = window.setTimeout(() => {
+      // Eight seconds is the generous upper bound for embed pages to
+      // fire load. Most fast servers (Vidsrc, MultiEmbed) load in
+      // under 2s; we wait 8s so a slow connection doesn't trip the
+      // "failed" status unnecessarily.
+      onServerStatus?.("failed");
+      setError("Embed took too long to load.");
+    }, IFRAME_LOAD_TIMEOUT_MS);
+    return () => {
+      if (loadTimerRef.current) {
+        window.clearTimeout(loadTimerRef.current);
+        loadTimerRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [server?.url, isIframe, reloadKey]);
+
+  // ───────── surface hls.js levels ──────────────────────────────────────
+  useEffect(() => {
+    if (!isHls) return;
     const id = window.setInterval(() => {
       const hls = hlsRef.current;
       if (!hls) return;
@@ -202,10 +269,11 @@ export function VideoPlayer({
         label: levelLabel(lvl),
       }));
       setLevels((prev) => {
-        // Avoid setState if nothing meaningfully changed.
         if (
           prev.length === mapped.length &&
-          prev.every((p, i) => p.height === mapped[i].height && p.bitrate === mapped[i].bitrate)
+          prev.every(
+            (p, i) => p.height === mapped[i].height && p.bitrate === mapped[i].bitrate,
+          )
         ) {
           return prev;
         }
@@ -214,9 +282,9 @@ export function VideoPlayer({
       window.clearInterval(id);
     }, 250);
     return () => window.clearInterval(id);
-  }, [streamUrl, reloadKey]);
+  }, [isHls, server?.url, reloadKey]);
 
-  // -------- video element events -----------------------------------------
+  // ───────── <video> events ─────────────────────────────────────────────
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -254,9 +322,9 @@ export function VideoPlayer({
       video.removeEventListener("canplay", onCanPlay);
       video.removeEventListener("volumechange", onVol);
     };
-  }, []);
+  }, [isHls]);
 
-  // -------- controls ------------------------------------------------------
+  // ───────── controls ───────────────────────────────────────────────────
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
@@ -295,7 +363,7 @@ export function VideoPlayer({
   const selectLevel = useCallback((index: number) => {
     const hls = hlsRef.current;
     if (!hls) return;
-    hls.currentLevel = index; // -1 = auto
+    hls.currentLevel = index;
     setCurrentLevel(index);
   }, []);
 
@@ -304,73 +372,129 @@ export function VideoPlayer({
     if (!video) return;
     const tracks = Array.from(video.textTracks);
     for (const track of tracks) {
-      // mode === 'showing' is the standard for "active subtitle track".
       track.mode = lang !== null && track.language === lang ? "showing" : "disabled";
     }
     setActiveSubtitleLang(lang);
   }, []);
 
   const fullscreen = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
+    const wrap = wrapRef.current;
+    if (!wrap) return;
     if (document.fullscreenElement) {
       void document.exitFullscreen();
     } else {
-      void video.requestFullscreen?.();
+      // The wrapper is the fullscreen element. Works for both HLS
+      // (the <video> inside fills the wrapper) and iframe (the
+      // iframe inside fills the wrapper). Stable layout in both
+      // modes.
+      const req =
+        wrap.requestFullscreen?.bind(wrap) ||
+        (wrap as HTMLDivElement & {
+          webkitRequestFullscreen?: () => Promise<void>;
+        }).webkitRequestFullscreen?.bind(wrap);
+      void req?.();
     }
   }, []);
 
   const reload = useCallback(() => {
+    setError(null);
     const video = videoRef.current;
-    if (!video) return;
-    video.currentTime = 0;
-    void video.load();
-    void video.play();
+    if (video) {
+      video.currentTime = 0;
+      void video.load();
+      void video.play();
+    }
   }, []);
 
-  const qualityMenuOpen = showQualityMenu ?? levels.length > 1;
-  const subtitleMenuOpen = showSubtitleMenu ?? subtitles.length > 0;
+  // ───────── derived UI state ───────────────────────────────────────────
+  const qualityMenuOpen = isHls && (server?.hasQuality ?? true) && levels.length > 1;
+  const subtitleMenuOpen = isHls && subtitles.length > 0;
+  const showSettingsUI = qualityMenuOpen || subtitleMenuOpen;
 
   const progress = useMemo(() => {
     if (!duration || !isFinite(duration)) return 0;
     return Math.min(100, (currentTime / duration) * 100);
   }, [currentTime, duration]);
 
+  // ───────── render ─────────────────────────────────────────────────────
   return (
     <div
+      ref={wrapRef}
       className={cn(
-        "group relative w-full overflow-hidden rounded-xl bg-black",
+        "video-player-wrap group relative h-full w-full overflow-hidden rounded-xl bg-black",
         className,
       )}
+      data-fs={isFullscreen ? "true" : "false"}
       dir="ltr"
       data-title={title}
+      data-server-key={server?.key ?? "none"}
+      data-server-kind={server?.kind ?? "none"}
     >
-      <video
-        ref={videoRef}
-        poster={poster}
-        controls={false}
-        playsInline
-        autoPlay={autoPlay}
-        muted={isMuted}
-        crossOrigin="anonymous"
-        className="block aspect-video w-full bg-black"
-        aria-label={title ?? "Video player"}
-      >
-        {subtitles.map((s) => (
-          <track
-            key={`${s.lang}-${s.file}`}
-            kind="subtitles"
-            src={s.file}
-            srcLang={s.lang}
-            label={s.label}
-            default={s.default}
+      {server ? (
+        isHls ? (
+          <video
+            ref={videoRef}
+            poster={poster}
+            controls={false}
+            playsInline
+            autoPlay={autoPlay}
+            muted={isMuted}
+            crossOrigin="anonymous"
+            className="block aspect-video h-full w-full bg-black object-contain"
+            aria-label={title ?? "Video player"}
+          >
+            {subtitles.map((s) => (
+              <track
+                key={`${s.lang}-${s.file}`}
+                kind="subtitles"
+                src={s.file}
+                srcLang={s.lang}
+                label={s.label}
+                default={s.default}
+              />
+            ))}
+          </video>
+        ) : (
+          <iframe
+            key={server.url}
+            src={server.url}
+            title={title ?? server.label}
+            className="block aspect-video h-full w-full border-0 bg-black"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; fullscreen; web-share"
+            allowFullScreen
+            referrerPolicy="no-referrer"
+            sandbox="allow-scripts allow-same-origin allow-presentation allow-popups allow-forms"
+            loading="eager"
+            onLoad={() => {
+              if (loadTimerRef.current) {
+                window.clearTimeout(loadTimerRef.current);
+                loadTimerRef.current = null;
+              }
+              onServerStatus?.("ok");
+              setIsLoading(false);
+            }}
+            onError={() => {
+              if (loadTimerRef.current) {
+                window.clearTimeout(loadTimerRef.current);
+                loadTimerRef.current = null;
+              }
+              onServerStatus?.("failed");
+              setError("Embed failed to load.");
+            }}
           />
-        ))}
-      </video>
+        )
+      ) : (
+        <div className="grid aspect-video h-full w-full place-items-center text-center text-white/55">
+          <div>
+            <AlertTriangle className="mx-auto size-10 text-amber-400" />
+            <p className="mt-2 text-sm">No playable stream yet.</p>
+          </div>
+        </div>
+      )}
 
       {/* Loading + error overlay */}
-      {isLoading && !error && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+      {isLoading && !error && server && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/30">
           <Loader2 className="h-10 w-10 animate-spin text-white/80" />
         </div>
       )}
@@ -388,190 +512,219 @@ export function VideoPlayer({
         </div>
       )}
 
-      {/* Controls — visible on hover for desktop, always visible while paused on mobile */}
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-3 opacity-100 transition-opacity group-hover:opacity-100" dir="ltr">
-        <div className="pointer-events-auto flex items-center gap-3 text-white">
-          <button
-            type="button"
-            onClick={togglePlay}
-            className="rounded-full p-2 hover:bg-white/10"
-            aria-label={isPlaying ? "Pause" : "Play"}
-          >
-            {isPlaying ? <Pause className="h-5 w-5" /> : <Play className="h-5 w-5" />}
-          </button>
+      {/* Controls — only when we have a server */}
+      {server && (
+        <div
+          className="video-controls pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 via-black/40 to-transparent p-3"
+          dir="ltr"
+        >
+          <div className="pointer-events-auto flex items-center gap-3 text-white">
+            {isHls && (
+              <>
+                <button
+                  type="button"
+                  onClick={togglePlay}
+                  className="rounded-full p-2 hover:bg-white/10"
+                  aria-label={isPlaying ? "Pause" : "Play"}
+                >
+                  {isPlaying ? (
+                    <Pause className="h-5 w-5" />
+                  ) : (
+                    <Play className="h-5 w-5" />
+                  )}
+                </button>
 
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={toggleMute}
-              className="rounded-full p-2 hover:bg-white/10"
-              aria-label={isMuted ? "Unmute" : "Mute"}
-            >
-              {isMuted || volume === 0 ? (
-                <VolumeX className="h-5 w-5" />
-              ) : (
-                <Volume2 className="h-5 w-5" />
-              )}
-            </button>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={volume}
-              onChange={handleVolumeInput}
-              className="h-1 w-20 cursor-pointer accent-white"
-              aria-label="Volume"
-            />
-          </div>
-
-          <div className="flex flex-1 items-center gap-2">
-            <span className="text-xs tabular-nums">{fmt(currentTime)}</span>
-            <input
-              type="range"
-              min={0}
-              max={isFinite(duration) && duration > 0 ? duration : 0}
-              step={0.1}
-              value={currentTime}
-              onChange={handleSeekInput}
-              className="h-1 flex-1 cursor-pointer accent-white"
-              aria-label="Seek"
-              style={{ ["--p" as string]: `${progress}%` }}
-            />
-            <span className="text-xs tabular-nums">{fmt(duration)}</span>
-          </div>
-
-          {(qualityMenuOpen || subtitleMenuOpen) && (
-            <div className="relative">
-              <button
-                type="button"
-                onClick={() => setShowSettings((s) => !s)}
-                className="rounded-full p-2 hover:bg-white/10"
-                aria-label="Settings"
-                aria-expanded={showSettings}
-              >
-                <SettingsIcon className="h-5 w-5" />
-              </button>
-              {showSettings && (
-                <div className="absolute bottom-14 right-0 w-56 max-w-[calc(100%-1rem)] overflow-hidden rounded-lg bg-black/95 text-sm text-white shadow-xl ring-1 ring-white/10">
-                  <div className="flex border-b border-white/10">
-                    {qualityMenuOpen && (
-                      <button
-                        type="button"
-                        onClick={() => setSettingsTab("quality")}
-                        className={cn(
-                          "flex-1 px-3 py-2",
-                          settingsTab === "quality" && "bg-white/10",
-                        )}
-                      >
-                        Quality
-                      </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={toggleMute}
+                    className="rounded-full p-2 hover:bg-white/10"
+                    aria-label={isMuted ? "Unmute" : "Mute"}
+                  >
+                    {isMuted || volume === 0 ? (
+                      <VolumeX className="h-5 w-5" />
+                    ) : (
+                      <Volume2 className="h-5 w-5" />
                     )}
-                    {subtitleMenuOpen && (
-                      <button
-                        type="button"
-                        onClick={() => setSettingsTab("subtitles")}
-                        className={cn(
-                          "flex-1 px-3 py-2",
-                          settingsTab === "subtitles" && "bg-white/10",
-                        )}
-                      >
-                        Subtitles
-                      </button>
-                    )}
-                  </div>
-                  <ul className="max-h-72 overflow-y-auto">
-                    {settingsTab === "quality" && (
-                      <>
-                        <li>
-                          <button
-                            type="button"
-                            onClick={() => selectLevel(-1)}
-                            className={cn(
-                              "flex w-full items-center justify-between px-3 py-2 hover:bg-white/10",
-                              currentLevel === -1 && "bg-white/10",
-                            )}
-                          >
-                            <span>Auto</span>
-                            {currentLevel === -1 && <span className="text-xs">●</span>}
-                          </button>
-                        </li>
-                        {levels.map((lvl) => (
-                          <li key={lvl.index}>
+                  </button>
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={volume}
+                    onChange={handleVolumeInput}
+                    className="h-1 w-20 cursor-pointer accent-white"
+                    aria-label="Volume"
+                  />
+                </div>
+
+                <div className="flex flex-1 items-center gap-2">
+                  <span className="text-xs tabular-nums">{fmt(currentTime)}</span>
+                  <input
+                    type="range"
+                    min={0}
+                    max={isFinite(duration) && duration > 0 ? duration : 0}
+                    step={0.1}
+                    value={currentTime}
+                    onChange={handleSeekInput}
+                    className="h-1 flex-1 cursor-pointer accent-white"
+                    aria-label="Seek"
+                    style={{ ["--p" as string]: `${progress}%` }}
+                  />
+                  <span className="text-xs tabular-nums">{fmt(duration)}</span>
+                </div>
+              </>
+            )}
+
+            {/* Iframe server — show a compact status pill where the
+                play/pause controls would be, since we can't drive the
+                embed's own UI. */}
+            {isIframe && (
+              <div className="flex flex-1 items-center gap-2 text-[11px] text-white/70">
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.06] px-2 py-1">
+                  <Captions className="size-3.5" />
+                  {server.label.split(" — ")[1] ?? server.label}
+                </span>
+              </div>
+            )}
+
+            {showSettingsUI && (
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => setShowSettings((s) => !s)}
+                  className="rounded-full p-2 hover:bg-white/10"
+                  aria-label="Settings"
+                  aria-expanded={showSettings}
+                >
+                  <SettingsIcon className="h-5 w-5" />
+                </button>
+                {showSettings && (
+                  <div className="absolute bottom-14 right-0 w-64 max-w-[calc(100%-1rem)] overflow-hidden rounded-lg bg-black/95 text-sm text-white shadow-xl ring-1 ring-white/10">
+                    <div className="flex border-b border-white/10">
+                      {qualityMenuOpen && (
+                        <button
+                          type="button"
+                          onClick={() => setSettingsTab("quality")}
+                          className={cn(
+                            "flex-1 px-3 py-2",
+                            settingsTab === "quality" && "bg-white/10",
+                          )}
+                        >
+                          Quality
+                        </button>
+                      )}
+                      {subtitleMenuOpen && (
+                        <button
+                          type="button"
+                          onClick={() => setSettingsTab("subtitles")}
+                          className={cn(
+                            "flex-1 px-3 py-2",
+                            settingsTab === "subtitles" && "bg-white/10",
+                          )}
+                        >
+                          Subtitles
+                        </button>
+                      )}
+                    </div>
+                    <ul className="max-h-72 overflow-y-auto">
+                      {settingsTab === "quality" && (
+                        <>
+                          <li>
                             <button
                               type="button"
-                              onClick={() => selectLevel(lvl.index)}
+                              onClick={() => selectLevel(-1)}
                               className={cn(
                                 "flex w-full items-center justify-between px-3 py-2 hover:bg-white/10",
-                                currentLevel === lvl.index && "bg-white/10",
+                                currentLevel === -1 && "bg-white/10",
                               )}
                             >
-                              <span>{lvl.label}</span>
-                              {currentLevel === lvl.index && <span className="text-xs">●</span>}
+                              <span>Auto</span>
+                              {currentLevel === -1 && <span className="text-xs">●</span>}
                             </button>
                           </li>
-                        ))}
-                      </>
-                    )}
-                    {settingsTab === "subtitles" && (
-                      <>
-                        <li>
-                          <button
-                            type="button"
-                            onClick={() => setSubtitle(null)}
-                            className={cn(
-                              "flex w-full items-center justify-between px-3 py-2 hover:bg-white/10",
-                              activeSubtitleLang === null && "bg-white/10",
-                            )}
-                          >
-                            <span className="inline-flex items-center gap-2">
-                              <Subtitles className="h-4 w-4" /> Off
-                            </span>
-                            {activeSubtitleLang === null && <span className="text-xs">●</span>}
-                          </button>
-                        </li>
-                        {subtitles.map((s) => (
-                          <li key={`${s.lang}-${s.file}`}>
+                          {levels.map((lvl) => (
+                            <li key={lvl.index}>
+                              <button
+                                type="button"
+                                onClick={() => selectLevel(lvl.index)}
+                                className={cn(
+                                  "flex w-full items-center justify-between px-3 py-2 hover:bg-white/10",
+                                  currentLevel === lvl.index && "bg-white/10",
+                                )}
+                              >
+                                <span>{lvl.label}</span>
+                                {currentLevel === lvl.index && (
+                                  <span className="text-xs">●</span>
+                                )}
+                              </button>
+                            </li>
+                          ))}
+                        </>
+                      )}
+                      {settingsTab === "subtitles" && (
+                        <>
+                          <li>
                             <button
                               type="button"
-                              onClick={() => setSubtitle(s.lang)}
+                              onClick={() => setSubtitle(null)}
                               className={cn(
                                 "flex w-full items-center justify-between px-3 py-2 hover:bg-white/10",
-                                activeSubtitleLang === s.lang && "bg-white/10",
+                                activeSubtitleLang === null && "bg-white/10",
                               )}
                             >
-                              <span>{s.label}</span>
-                              {activeSubtitleLang === s.lang && (
+                              <span className="inline-flex items-center gap-2">
+                                <Subtitles className="h-4 w-4" /> Off
+                              </span>
+                              {activeSubtitleLang === null && (
                                 <span className="text-xs">●</span>
                               )}
                             </button>
                           </li>
-                        ))}
-                      </>
-                    )}
-                  </ul>
-                  <button
-                    type="button"
-                    onClick={() => setShowSettings(false)}
-                    className="block w-full border-t border-white/10 px-3 py-2 text-left hover:bg-white/10"
-                  >
-                    Close
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
+                          {subtitles.map((s) => (
+                            <li key={`${s.lang}-${s.file}`}>
+                              <button
+                                type="button"
+                                onClick={() => setSubtitle(s.lang)}
+                                className={cn(
+                                  "flex w-full items-center justify-between px-3 py-2 hover:bg-white/10",
+                                  activeSubtitleLang === s.lang && "bg-white/10",
+                                )}
+                              >
+                                <span>{s.label}</span>
+                                {activeSubtitleLang === s.lang && (
+                                  <span className="text-xs">●</span>
+                                )}
+                              </button>
+                            </li>
+                          ))}
+                        </>
+                      )}
+                    </ul>
+                    <button
+                      type="button"
+                      onClick={() => setShowSettings(false)}
+                      className="block w-full border-t border-white/10 px-3 py-2 text-left hover:bg-white/10"
+                    >
+                      Close
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
 
-          <button
-            type="button"
-            onClick={fullscreen}
-            className="rounded-full p-2 hover:bg-white/10"
-            aria-label="Fullscreen"
-          >
-            <ChevronDown className="h-5 w-5 -rotate-45" />
-          </button>
+            <button
+              type="button"
+              onClick={fullscreen}
+              className="rounded-full p-2 hover:bg-white/10"
+              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            >
+              <ChevronDown className="h-5 w-5 -rotate-45" />
+            </button>
+          </div>
         </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -2,13 +2,16 @@
  * Serverless subtitle proxy.
  *
  * Keeps the SubDL API key (and TMDB key, for external_ids) off the
- * client. Two routes share the same function:
+ * client. Three routes share the same function:
  *
  *   GET /api/subtitles/tmdb-external-ids?tmdbId=1399&mediaType=tv
  *     → { imdb_id: "tt0944947" }        (or null)
  *
  *   GET /api/subtitles/subdl?imdb_id=tt0944947&languages=sd_ar
  *     → SubDL JSON, passthrough
+ *
+ *   GET /api/subtitles/bundled?title=odyssey
+ *     → WebVTT text (the bundled Arabic subtitle for "Odyssey")
  *
  * Configure on Vercel (server-side — NOT VITE_*):
  *   SUBDL_API_KEY=...
@@ -107,6 +110,51 @@ async function handleSubdlLookup(request: Request): Promise<Response> {
   }
 }
 
+/* ───────────────────────────  Bundled subtitles  ─────────────────────────── */
+
+/**
+ * Catalog of subtitle files bundled with the deployment. Each entry
+ * maps a `title` key to a relative path inside `public/subtitles/`.
+ *
+ * The Vercel / web hosting layer serves `public/` as static assets,
+ * so `ODYSSEY_AR_VTT_URL` is `https://<host>/subtitles/odyssey.ar.vtt`.
+ * The serverless function does *not* read the file — it just forwards
+ * the URL — so the file stays cacheable and free of edge-function
+ * cold starts.
+ */
+const BUNDLED_SUBTITLES: Record<string, { url: string; lang: string; label: string }> = {
+  odyssey: {
+    url: "/subtitles/odyssey.ar.vtt",
+    lang: "ar",
+    label: "العربية",
+  },
+};
+
+async function handleBundled(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const title = (url.searchParams.get("title") ?? "").trim().toLowerCase();
+  if (!title) {
+    return jsonResponse({ error: "Missing title" }, 400);
+  }
+  const entry = BUNDLED_SUBTITLES[title];
+  if (!entry) {
+    return jsonResponse({ error: "No bundled subtitle for this title" }, 404);
+  }
+  // The browser then hits the same-origin `/subtitles/odyssey.ar.vtt`
+  // directly; we just return the metadata so the client can decide
+  // whether to insert it into the player tracklist.
+  return jsonResponse(
+    {
+      success: true,
+      title,
+      lang: entry.lang,
+      label: entry.label,
+      file: entry.url,
+    },
+    200,
+  );
+}
+
 /* ───────────────────────────  Router  ─────────────────────────── */
 
 export default async function handler(request: Request): Promise<Response> {
@@ -128,6 +176,9 @@ export default async function handler(request: Request): Promise<Response> {
   }
   if (subPath === "subdl") {
     return handleSubdlLookup(request);
+  }
+  if (subPath === "bundled") {
+    return handleBundled(request);
   }
   return jsonResponse({ error: "Not Found" }, 404);
 }

@@ -22,6 +22,8 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Badge, Button } from "../components/ui/Primitives";
 import { EpisodeChip, EpisodePicker } from "../components/EpisodePicker";
+import { ServerSwitcher, type ServerStatus } from "../components/ServerSwitcher";
+import { SubtitleToggle } from "../components/SubtitleToggle";
 import { VideoPlayer, type SubtitleTrack } from "../components/VideoPlayer";
 import { type MediaType, type Title } from "../data/catalog";
 import { useRoomSync } from "../hooks/useRoomSync";
@@ -38,17 +40,15 @@ import {
   type TmdbDetails,
 } from "../lib/tmdb";
 import { fetchArabicSubtitle } from "../lib/subtitles";
-import { fetchDirectStreamUrl } from "../lib/stream";
+import { fetchEmbedServers, type EmbedServer } from "../lib/stream";
 import { cn } from "../utils/cn";
 
 /* ───────────────────────────  Stream source  ─────────────────────────── */
 
-// Fallback stream rendered while the resolver is in-flight. The
-// `fetchDirectStreamUrl` helper has its own fallback, but we seed the
-// state with one so the very first render of <VideoPlayer /> always
-// receives a non-empty `streamUrl` prop.
-const FALLBACK_STREAM =
-  "https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8";
+// No client-side fallback. When the resolver is missing, fails, or
+// returns no playable servers, `fetchEmbedServers` returns an empty
+// array and the player surfaces an honest "no stream" state instead
+// of playing a placeholder.
 
 /**
  * Arabic subtitle track(s) passed straight to <VideoPlayer />.
@@ -62,11 +62,30 @@ const ARABIC_SUBTITLES: SubtitleTrack[] = [
   {
     lang: "ar",
     label: "العربية",
-    file: "/subtitles/arabic.vtt",
+    file: "/subtitles/odyssey.ar.vtt",
     default: true,
   },
 ];
 
+/**
+ * Detect Christopher Nolan's "Odyssey" (and other films tagged with
+ * the same original title) so we can pre-load the bundled Arabic
+ * subtitle file ahead of the SubDL fallback.
+ *
+ * The detection is deliberately lenient — TMDB's `original_title`
+ * is "The Odyssey" for the 2026 film, but operators may also have
+ * older titles with the same logic. Match by `original_title` first,
+ * then by English `title` containing "odyssey", then by Arabic
+ * translated title.
+ */
+function isOdysseyTitle(details: TmdbDetails | null): boolean {
+  if (!details) return false;
+  const original = (details.original_title ?? details.original_name ?? "").toLowerCase();
+  const title = (details.title ?? details.name ?? "").toLowerCase();
+  if (original === "the odyssey" || title === "the odyssey") return true;
+  if (original.includes("odyssey") || title.includes("odyssey")) return true;
+  return false;
+}
 const EMOJIS = ["🔥", "😂", "😍", "🍿", "👏", "😱", "💜", "🎬"];
 
 const SEEK_STEP_S = 20;
@@ -174,7 +193,11 @@ export function RoomPage({
   // `null` means "not yet attempted" or "no key configured" — both
   // are fine; the static `ARABIC_SUBTITLES` entry remains as a fallback.
   const [arabicSubtitle, setArabicSubtitle] = useState<SubtitleTrack | null>(null);
+  const [activeSubtitleLang, setActiveSubtitleLang] = useState<string | null>(null);
   const [serverIdx, setServerIdx] = useState(0);
+  // Per-server status (used to color the switcher pills + drive auto-
+  // fallback when an iframe server fails to load).
+  const [serverStatuses, setServerStatuses] = useState<Record<number, ServerStatus>>({});
   const [season, setSeason] = useState(1);
   const [episode, setEpisode] = useState(1);
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -287,33 +310,75 @@ export function RoomPage({
     };
   }, [mediaType, tmdbId]);
 
-  /* ----------  Per-title HLS stream URL ---------- */
-  // Resolved asynchronously via `fetchDirectStreamUrl`, which:
-  //   1. Returns the host-provided `customStreamUrl` immediately if any.
-  //   2. Otherwise calls `/api/stream` (edge function reading
-  //      `STREAM_RESOLVER_URL`).
-  //   3. Falls back to the Mux test stream on any failure.
-  //
-  // We seed the state with the fallback so the first <VideoPlayer />
-  // render always gets a non-empty `streamUrl`. The effect below
-  // upgrades it as soon as the resolver responds.
-  const [streamUrl, setStreamUrl] = useState<string>(FALLBACK_STREAM);
+  /* ----------  Per-title embed servers ---------- */
+  // The resolver returns up to 6 servers (Server 1 = HLS, Servers 2-6 =
+  // iframe embeds). The host picks one via the switcher; peers mirror
+  // the host's pick via `mediaState.serverIdx` (already in the
+  // room-sync payload).
+  const [servers, setServers] = useState<EmbedServer[]>([]);
+  // Tracks whether the resolver has finished a round-trip for the
+  // current title. Used to swap the spinner overlay for the "no
+  // playable stream" copy once we know the resolver came back empty
+  // (vs. still in flight).
+  const [resolverAttempted, setResolverAttempted] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    fetchDirectStreamUrl({
+    setServers([]);
+    setResolverAttempted(false);
+    if (!tmdbId) return;
+    fetchEmbedServers({
       tmdbId,
       mediaType,
       season,
       episode,
       customStreamUrl: mediaState?.customStreamUrl ?? null,
-    }).then((url) => {
+    }).then((list) => {
       if (cancelled) return;
-      if (url) setStreamUrl(url);
+      setServers(list);
+      setResolverAttempted(true);
     });
     return () => {
       cancelled = true;
     };
   }, [tmdbId, mediaType, season, episode, mediaState?.customStreamUrl]);
+
+  // The active server the player is currently rendering. Default 0
+  // (Server 1 = HLS). Mirrors what the host broadcasts via
+  // `mediaState.serverIdx` for joiners.
+  const activeServerIdx = Math.min(
+    Math.max(0, serverIdx),
+    Math.max(0, servers.length - 1),
+  );
+  const activeServer = servers[activeServerIdx] ?? null;
+
+  // Pre-compute the subtitle list. Odyssey gets the bundled file
+  // first (always available, works without SubDL), then the SubDL
+  // lookup fills in if/when it returns. Other titles skip the bundled
+  // file and rely on SubDL.
+  const allSubtitles: SubtitleTrack[] = useMemo(() => {
+    const base: SubtitleTrack[] = isOdysseyTitle(details)
+      ? [
+          {
+            lang: "ar",
+            label: "العربية (Odyssey)",
+            file: "/subtitles/odyssey.ar.vtt",
+            default: true,
+          },
+        ]
+      : [];
+    if (arabicSubtitle) {
+      base.push({ ...arabicSubtitle, default: base.length === 0 });
+    }
+    if (base.length === 0) {
+      // Static fallback for rooms that haven't run the SubDL lookup
+      // yet. The bundled file is the Odyssey subtitle, but it works
+      // as a generic Arabic track for any title (the player shows
+      // nothing rather than wrong text if the file doesn't have a
+      // given cue).
+      base.push(...ARABIC_SUBTITLES.map((s) => ({ ...s, default: true })));
+    }
+    return base;
+  }, [arabicSubtitle, details]);
 
   /* ----------  Derived active title  ---------- */
   const movie: Title = useMemo(() => {
@@ -717,6 +782,46 @@ export function RoomPage({
             </div>
           </div>
 
+          {/* Server switcher (host-only) + subtitle toggle. The
+              switcher only renders once we have at least one server;
+              the toggle renders once subtitles are loaded. Both live
+              directly above the player so the controls are reachable
+              in one tap on mobile. */}
+          {servers.length > 0 && (
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-center">
+              <ServerSwitcher
+                servers={servers}
+                activeIndex={activeServerIdx}
+                canControl={canControlRoom}
+                onSelect={(idx) => {
+                  // setServerIdx + the existing broadcastMedia effect
+                  // (which keys on serverIdx) auto-broadcasts to peers.
+                  setServerIdx(idx);
+                }}
+                onStatusChange={(idx, status) => {
+                  setServerStatuses((prev) => {
+                    if (prev[idx] === status) return prev;
+                    return { ...prev, [idx]: status };
+                  });
+                }}
+                serverStatuses={serverStatuses}
+                className="lg:flex-1"
+              />
+              {allSubtitles.length > 0 && (
+                <SubtitleToggle
+                  tracks={allSubtitles.map((s) => ({
+                    lang: s.lang,
+                    label: s.label,
+                    isArabic: s.lang === "ar",
+                  }))}
+                  activeLang={activeSubtitleLang}
+                  onChange={setActiveSubtitleLang}
+                  className="shrink-0"
+                />
+              )}
+            </div>
+          )}
+
           {/* The video player container. NO pointer-events for non-hosts
               so they cannot manually desync the room. The wrapper
               itself stays `pointer-events: auto` for the host (or for
@@ -727,19 +832,26 @@ export function RoomPage({
             className="relative aspect-video w-full overflow-hidden rounded-3xl border border-white/[0.08] bg-black shadow-[0_30px_90px_-40px_rgba(168,85,247,0.7)]"
             style={{ pointerEvents: canControlRoom ? "auto" : "none" }}
           >
-            {/* Hide the underlying player when we don't yet have a title
-                for this peer. Rendering the player would otherwise
-                surface a frozen Mux fallback frame that looks broken. */}
-            {tmdbId ? (
+            {/* Mount the player when we have BOTH a title AND at least
+                one resolved server. Otherwise surface an honest state:
+                either the "pick a title" CTA (no title) or a
+                "resolving stream" overlay (title known but resolver
+                in flight / returned empty). */}
+            {tmdbId && activeServer ? (
               <VideoPlayer
-                key={`${tmdbId}-${season}-${episode}-${streamUrl}`}
-                streamUrl={streamUrl}
+                key={`${tmdbId}-${season}-${episode}-${activeServerIdx}-${activeServer.url}`}
+                server={activeServer}
                 title={roomTitle}
-                subtitles={
-                  arabicSubtitle
-                    ? [arabicSubtitle, ...ARABIC_SUBTITLES.map((s) => ({ ...s, default: false }))]
-                    : ARABIC_SUBTITLES
-                }
+                subtitles={allSubtitles}
+                onServerStatus={(status) => {
+                  // Pipe the iframe load events into the switcher's
+                  // status map so the pill colors update + auto-
+                  // fallback kicks in.
+                  setServerStatuses((prev) => {
+                    if (prev[activeServerIdx] === status) return prev;
+                    return { ...prev, [activeServerIdx]: status };
+                  });
+                }}
                 className="h-full w-full rounded-xl"
               />
             ) : null}
@@ -790,6 +902,36 @@ export function RoomPage({
                       </button>
                     </div>
                   )}
+                </div>
+              </div>
+            )}
+            {/* Stream-overlay — shown only when we have a title but no
+                playable servers yet (resolver in flight, or resolver
+                returned 404 / 502 / not configured). */}
+            {tmdbId && servers.length === 0 && (
+              <div className="pointer-events-none absolute inset-0 grid place-items-center overflow-hidden bg-black/40">
+                <div className="pointer-events-none absolute -top-32 -right-32 size-72 rounded-full bg-brand/20 blur-3xl" />
+                <div className="pointer-events-none absolute -bottom-32 -left-32 size-72 rounded-full bg-fuchsia-500/15 blur-3xl" />
+                <div className="relative flex flex-col items-center gap-4 text-center">
+                  <div className="relative grid size-20 place-items-center rounded-3xl bg-gradient-to-br from-[#A855F7]/30 to-[#5B21B6]/30 ring-1 ring-white/10">
+                    {resolverAttempted ? (
+                      <Film className="size-9 text-rose-300" />
+                    ) : (
+                      <Loader2 className="size-9 animate-spin text-brand" />
+                    )}
+                  </div>
+                  <div>
+                    <p className="text-[14px] font-bold text-white">
+                      {resolverAttempted
+                        ? "تعذّر العثور على بث قابل للتشغيل"
+                        : "جاري البحث عن بث للعنوان…"}
+                    </p>
+                    <p className="mt-1 text-[12px] text-white/45">
+                      {resolverAttempted
+                        ? "تحقق من ضبط STREAM_RESOLVER_URL على Vercel أو أعد المحاولة."
+                        : "يتم الاتصال بمحلل البث ومزامنة المصدر."}
+                    </p>
+                  </div>
                 </div>
               </div>
             )}
