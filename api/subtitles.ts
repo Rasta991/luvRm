@@ -10,12 +10,18 @@
  *   GET /api/subtitles/subdl?imdb_id=tt0944947&languages=sd_ar
  *     → SubDL JSON, passthrough
  *
- * Configure in `.env` (server-side — *not* VITE_*):
+ * Configure on Vercel (server-side — NOT VITE_*):
  *   SUBDL_API_KEY=...
  *   TMDB_API_KEY=...
  *
  * Set `VITE_SUBDL_PROXY_URL` on the client to point here.
+ *
+ * Runtime: Edge. Standard global `Request` / `Response` only.
  */
+
+export const config = {
+  runtime: "edge",
+};
 
 const TMDB_BASE = "https://api.themoviedb.org/3";
 const SUBDL_BASE = "https://api.subdl.com/api/v1/subtitles";
@@ -31,48 +37,51 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
-function applyCors(res: any) {
-  for (const [k, v] of Object.entries(CORS_HEADERS)) res.setHeader(k, v);
+function jsonResponse(body: unknown, status: number): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type": "application/json; charset=utf-8",
+    },
+  });
 }
 
 /* ───────────────────────────  Route handlers  ─────────────────────────── */
 
-async function handleTmdbExternalIds(req: any, res: any): Promise<void> {
-  const tmdbId = Number(req.query?.tmdbId);
-  const mediaType = String(req.query?.mediaType ?? "movie");
-  if (!tmdbId || !["movie", "tv"].includes(mediaType)) {
-    res.status(400).json({ error: "Bad tmdbId/mediaType" });
-    return;
+async function handleTmdbExternalIds(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const tmdbId = Number(url.searchParams.get("tmdbId") ?? 0);
+  const mediaType = url.searchParams.get("mediaType") ?? "movie";
+  if (!tmdbId || (mediaType !== "movie" && mediaType !== "tv")) {
+    return jsonResponse({ error: "Bad tmdbId/mediaType" }, 400);
   }
   if (!TMDB_API_KEY) {
-    res.status(500).json({ error: "TMDB_API_KEY not configured" });
-    return;
+    return jsonResponse({ error: "TMDB_API_KEY not configured" }, 500);
   }
 
-  const url = `${TMDB_BASE}/${mediaType}/${tmdbId}/external_ids?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
+  const upstream = `${TMDB_BASE}/${mediaType}/${tmdbId}/external_ids?api_key=${encodeURIComponent(TMDB_API_KEY)}`;
   try {
-    const r = await fetch(url);
+    const r = await fetch(upstream);
     if (!r.ok) {
-      res.status(r.status).json({ error: `TMDB ${r.status}` });
-      return;
+      return jsonResponse({ error: `TMDB ${r.status}` }, r.status);
     }
     const data = (await r.json()) as { imdb_id?: string | null };
-    res.status(200).json({ imdb_id: data?.imdb_id ?? null });
-  } catch (e) {
-    res.status(502).json({ error: "Upstream TMDB call failed" });
+    return jsonResponse({ imdb_id: data?.imdb_id ?? null }, 200);
+  } catch {
+    return jsonResponse({ error: "Upstream TMDB call failed" }, 502);
   }
 }
 
-async function handleSubdlLookup(req: any, res: any): Promise<void> {
-  const imdbId = String(req.query?.imdb_id ?? "").trim();
-  const languages = String(req.query?.languages ?? "sd_ar");
+async function handleSubdlLookup(request: Request): Promise<Response> {
+  const url = new URL(request.url);
+  const imdbId = (url.searchParams.get("imdb_id") ?? "").trim();
+  const languages = url.searchParams.get("languages") ?? "sd_ar";
   if (!imdbId) {
-    res.status(400).json({ error: "Missing imdb_id" });
-    return;
+    return jsonResponse({ error: "Missing imdb_id" }, 400);
   }
   if (!SUBDL_API_KEY) {
-    res.status(500).json({ error: "SUBDL_API_KEY not configured" });
-    return;
+    return jsonResponse({ error: "SUBDL_API_KEY not configured" }, 500);
   }
 
   const params = new URLSearchParams({
@@ -83,44 +92,42 @@ async function handleSubdlLookup(req: any, res: any): Promise<void> {
   try {
     const r = await fetch(`${SUBDL_BASE}?${params.toString()}`);
     if (!r.ok) {
-      res.status(r.status).json({ error: `SubDL ${r.status}` });
-      return;
+      return jsonResponse({ error: `SubDL ${r.status}` }, r.status);
     }
-    // Stream the body straight through — keep SubDL's JSON shape.
     const body = await r.text();
-    res.status(200);
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.send(body);
+    return new Response(body, {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type": "application/json; charset=utf-8",
+      },
+    });
   } catch {
-    res.status(502).json({ error: "Upstream SubDL call failed" });
+    return jsonResponse({ error: "Upstream SubDL call failed" }, 502);
   }
 }
 
 /* ───────────────────────────  Router  ─────────────────────────── */
 
-export default async function handler(req: any, res: any): Promise<void> {
-  applyCors();
-
-  if (req.method === "OPTIONS") {
-    res.status(204).end();
-    return;
+export default async function handler(request: Request): Promise<Response> {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { status: 204, headers: CORS_HEADERS });
   }
-  if (req.method !== "GET") {
-    res.status(405).json({ error: "Method Not Allowed" });
-    return;
+  if (request.method !== "GET") {
+    return jsonResponse({ error: "Method Not Allowed" }, 405);
   }
 
-  // Vercel gives us `req.url` like "/api/subtitles/tmdb-external-ids?...".
+  // Vercel gives us `request.url` like "/api/subtitles/tmdb-external-ids?...".
   // Strip the function path so we route by suffix.
-  const rawUrl: string = req.url ?? "/";
+  const rawUrl = request.url ?? "/";
   const pathOnly = rawUrl.split("?")[0].replace(/\/+$/, "");
   const subPath = pathOnly.replace(/^\/?api\/subtitles\/?/, "");
 
   if (subPath === "tmdb-external-ids") {
-    await handleTmdbExternalIds(req, res);
-  } else if (subPath === "subdl") {
-    await handleSubdlLookup(req, res);
-  } else {
-    res.status(404).json({ error: "Not Found" });
+    return handleTmdbExternalIds(request);
   }
+  if (subPath === "subdl") {
+    return handleSubdlLookup(request);
+  }
+  return jsonResponse({ error: "Not Found" }, 404);
 }

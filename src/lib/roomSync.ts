@@ -61,7 +61,11 @@ export interface PlaybackState {
   tmdbId: number;
   season: number;
   episode: number;
-  /** Active stream provider index (0..5). 0 = VidLink, etc. */
+  /**
+   * Selected server index from a multi-server provider UI.
+   * Reserved for forward-compatibility — not consumed by the HLS
+   * resolver path today.
+   */
   serverIdx?: number;
 }
 
@@ -219,19 +223,20 @@ const writeRoomState = (code: string, state: RoomMediaState) => {
 };
 
 /**
- * Build a self-contained server URL for the given media state. The
- * host's UI knows about the full provider chain, but the engine
- * itself only needs a stable default so the dual-sync fallback can
- * give joiners *something* to mount while the richer media:state
- * round-trip completes. The UI then re-keys its iframe on the full
- * provider list once `media:state` lands.
+ * Legacy embed URL builder. Reserved as a stable string in
+ * `RoomMediaState.currentServerUrl` for backward compatibility with
+ * peers that still expect the field.
+ *
+ * No longer points at any upstream. The room now resolves its
+ * playback URL through `/api/stream` (see `src/lib/stream.ts`), and
+ * `useRoomSync` already consumes the field with `void
+ * currentServerUrl`. Returning an empty string here means a
+ * misbehaving peer that *does* try to mount the URL will get an
+ * `<iframe src="">`-shaped failure rather than a request to a
+ * third-party host.
  */
-const buildEmbedUrl = (state: RoomMediaState): string => {
-  const { mediaType, tmdbId, season, episode } = state;
-  if (mediaType === "tv") {
-    return `https://vidsrc.pro/embed/tv/${tmdbId}/${season}/${episode}`;
-  }
-  return `https://vidsrc.pro/embed/movie/${tmdbId}`;
+const buildEmbedUrl = (_state: RoomMediaState): string => {
+  return "";
 };
 
 /** A unique-ish member id. Stable per tab via sessionStorage. */

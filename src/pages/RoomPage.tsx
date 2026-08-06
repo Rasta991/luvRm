@@ -32,7 +32,9 @@ import { readRoomState } from "../lib/roomSync";
 import {
   formatRuntime,
   getDetails,
+  getTrending,
   tmdbDetailsToTitle,
+  tmdbToTitle,
   type TmdbDetails,
 } from "../lib/tmdb";
 import { fetchArabicSubtitle } from "../lib/subtitles";
@@ -176,6 +178,12 @@ export function RoomPage({
   const [season, setSeason] = useState(1);
   const [episode, setEpisode] = useState(1);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Inline "Pick a title" panel — only meaningful for the host when the
+  // room was opened with no `tmdbId`. Lets the host recover without
+  // leaving the room and re-creating it from the CreateRoomModal.
+  const [titlePickerOpen, setTitlePickerOpen] = useState(false);
+  const [trending, setTrending] = useState<Title[]>([]);
+  const [trendingLoading, setTrendingLoading] = useState(false);
   const [copied, setCopied] = useState<"code" | "link" | null>(null);
   const [draft, setDraft] = useState("");
   const [tab, setTab] = useState<"chat" | "members">("chat");
@@ -476,6 +484,39 @@ export function RoomPage({
   //    need a second listener here.
 
   /* ----------  Handlers ---------- */
+
+  // Load trending titles lazily — only when the host actually opens the
+  // inline picker. Reusing TMDB's `/trending/all/week` keeps the panel
+  // consistent with what the Hero and CreateRoomModal already show.
+  useEffect(() => {
+    if (!titlePickerOpen) return;
+    if (trending.length > 0 || trendingLoading) return;
+    let cancelled = false;
+    setTrendingLoading(true);
+    getTrending("all")
+      .then((items) => {
+        if (cancelled) return;
+        const titles = items
+          .filter((it) => !!it.poster_path)
+          .slice(0, 10)
+          .map((it) =>
+            tmdbToTitle(it, it.media_type === "tv" ? "tv" : "movie"),
+          );
+        setTrending(titles);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setTrending([]);
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setTrendingLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [titlePickerOpen, trending.length, trendingLoading]);
+
   const send = () => {
     if (!draft.trim()) return;
     sendMessage(draft);
@@ -686,21 +727,27 @@ export function RoomPage({
             className="relative aspect-video w-full overflow-hidden rounded-3xl border border-white/[0.08] bg-black shadow-[0_30px_90px_-40px_rgba(168,85,247,0.7)]"
             style={{ pointerEvents: canControlRoom ? "auto" : "none" }}
           >
-            <VideoPlayer
-              key={`${tmdbId}-${season}-${episode}-${streamUrl}`}
-              streamUrl={streamUrl}
-              title={roomTitle}
-              subtitles={
-                arabicSubtitle
-                  ? [arabicSubtitle, ...ARABIC_SUBTITLES.map((s) => ({ ...s, default: false }))]
-                  : ARABIC_SUBTITLES
-              }
-              className="h-full w-full rounded-xl"
-            />
-            {/* Loader overlay — shown while we're waiting on the host
-                for the title (no `tmdbId` yet) or while the resolver
-                is in flight. The player below is the Mux fallback
-                during this brief window. */}
+            {/* Hide the underlying player when we don't yet have a title
+                for this peer. Rendering the player would otherwise
+                surface a frozen Mux fallback frame that looks broken. */}
+            {tmdbId ? (
+              <VideoPlayer
+                key={`${tmdbId}-${season}-${episode}-${streamUrl}`}
+                streamUrl={streamUrl}
+                title={roomTitle}
+                subtitles={
+                  arabicSubtitle
+                    ? [arabicSubtitle, ...ARABIC_SUBTITLES.map((s) => ({ ...s, default: false }))]
+                    : ARABIC_SUBTITLES
+                }
+                className="h-full w-full rounded-xl"
+              />
+            ) : null}
+            {/* Loader overlay — branches by role:
+                  • Joiner (non-host): "waiting on host data" with retry.
+                  • Host / solo viewer: actionable "Pick a title" CTA
+                    that opens an inline trending panel, so the host can
+                    recover without leaving the room. */}
             {!tmdbId && (
               <div className="pointer-events-none absolute inset-0 grid place-items-center overflow-hidden">
                 <div className="pointer-events-none absolute -top-32 -right-32 size-72 rounded-full bg-brand/20 blur-3xl" />
@@ -709,20 +756,40 @@ export function RoomPage({
                   <div className="relative grid size-20 place-items-center rounded-3xl bg-gradient-to-br from-[#A855F7]/30 to-[#5B21B6]/30 ring-1 ring-white/10">
                     <Film className="size-9 animate-pulse text-brand" />
                   </div>
-                  <div>
-                    <p className="text-[14px] font-bold text-white">
-                      بانتظار بيانات المضيف
-                    </p>
-                    <p className="mt-1 text-[12px] text-white/45">
-                      يتم تنزيل جلسة المضيف لتزامن البث
-                    </p>
-                    <button
-                      onClick={requestMedia}
-                      className="pointer-events-auto mt-3 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.04] px-3 py-1.5 text-[11px] text-white/70 transition hover:border-brand/50 hover:text-white"
-                    >
-                      إعادة طلب البيانات
-                    </button>
-                  </div>
+                  {canControlRoom ? (
+                    <>
+                      <div>
+                        <p className="text-[14px] font-bold text-white">
+                          ابدأ باختيار عنوان للبث
+                        </p>
+                        <p className="mt-1 text-[12px] text-white/45">
+                          أنت المضيف — اختر فيلمًا أو مسلسلًا لتبدأ المزامنة
+                        </p>
+                      </div>
+                      <button
+                        onClick={() => setTitlePickerOpen(true)}
+                        className="pointer-events-auto inline-flex items-center gap-2 rounded-full bg-gradient-to-br from-[#A855F7] to-[#5B21B6] px-5 py-2.5 text-[13px] font-bold text-white shadow-[0_8px_24px_-8px_rgba(168,85,247,0.8)] transition hover:scale-[1.03]"
+                      >
+                        <Play className="size-4 fill-current" />
+                        اختر عنوانًا للبدء
+                      </button>
+                    </>
+                  ) : (
+                    <div>
+                      <p className="text-[14px] font-bold text-white">
+                        بانتظار بيانات المضيف
+                      </p>
+                      <p className="mt-1 text-[12px] text-white/45">
+                        يتم تنزيل جلسة المضيف لتزامن البث
+                      </p>
+                      <button
+                        onClick={requestMedia}
+                        className="pointer-events-auto mt-3 inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/[0.04] px-3 py-1.5 text-[11px] text-white/70 transition hover:border-brand/50 hover:text-white"
+                      >
+                        إعادة طلب البيانات
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1073,6 +1140,106 @@ export function RoomPage({
           }}
         />
       )}
+
+      {/* Inline title picker — host-only, opened from the empty-room
+          overlay. Lets the host pick a movie/show without leaving the
+          room. Closes after a choice is made. */}
+      <AnimatePresence>
+        {titlePickerOpen && canControlRoom && (
+          <>
+            <motion.div
+              key="titlepicker-backdrop"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setTitlePickerOpen(false)}
+              className="fixed inset-0 z-[80] bg-black/75 backdrop-blur-md"
+            />
+            <div className="fixed inset-0 z-[81] grid place-items-center overflow-y-auto p-4">
+              <motion.div
+                key="titlepicker-card"
+                initial={{ opacity: 0, scale: 0.94, y: 24 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.96, y: 16 }}
+                transition={{ type: "spring", stiffness: 300, damping: 28 }}
+                className="glass relative w-full max-w-lg overflow-hidden rounded-3xl p-6 shadow-2xl glow-brand"
+              >
+                <div className="pointer-events-none absolute -top-24 -right-16 size-64 rounded-full bg-brand/25 blur-3xl" />
+                <div className="relative">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <div className="mb-2 inline-flex items-center gap-1.5 rounded-full border border-brand/30 bg-brand/10 px-2.5 py-1 text-[10px] font-bold tracking-widest text-[#DDBBFF]">
+                        ابدأ البث
+                      </div>
+                      <h3 className="font-display text-2xl font-extrabold text-white">
+                        اختر عنوانًا للبدء
+                      </h3>
+                      <p className="mt-1 text-[13px] text-white/45">
+                        سيبدأ التشغيل فورًا وتتم مزامنة جميع المتابعين.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => setTitlePickerOpen(false)}
+                      className="grid size-9 place-items-center rounded-full text-white/60 transition hover:bg-white/5 hover:text-white"
+                      aria-label="إغلاق"
+                    >
+                      <Ban className="size-5" />
+                    </button>
+                  </div>
+
+                  <div className="mt-5">
+                    {trendingLoading && trending.length === 0 ? (
+                      <div className="flex h-28 items-center gap-2 px-2 text-[12px] text-white/45">
+                        <Loader2 className="size-4 animate-spin text-brand" />
+                        جاري تحميل الاقتراحات…
+                      </div>
+                    ) : trending.length === 0 ? (
+                      <div className="rounded-2xl border border-white/10 bg-white/[0.03] p-4 text-[12.5px] text-white/55">
+                        تعذّر تحميل الاقتراحات. أضف
+                        {" "}
+                        <code className="rounded bg-white/10 px-1 py-0.5 text-[11px]">VITE_TMDB_API_KEY</code>
+                        {" "}
+                        في Vercel لإظهار قائمة الرائج.
+                      </div>
+                    ) : (
+                      <div className="no-scrollbar -mx-1 flex gap-2 overflow-x-auto px-1 pb-2">
+                        {trending.map((t) => (
+                          <button
+                            key={t.id}
+                            onClick={() => {
+                              if (!t.tmdbId) return;
+                              setMediaType(t.mediaType);
+                              setTmdbId(t.tmdbId);
+                              setSeason(1);
+                              setEpisode(1);
+                              setResolvedFromSync(false);
+                              setTitlePickerOpen(false);
+                            }}
+                            className="group relative h-32 w-20 shrink-0 overflow-hidden rounded-xl border-2 border-white/10 transition hover:border-brand/70 hover:shadow-[0_0_24px_-6px_rgba(168,85,247,0.9)]"
+                            title={`${t.name} (${t.year || "—"})`}
+                          >
+                            <img
+                              src={t.poster}
+                              alt={t.name}
+                              loading="lazy"
+                              className="size-full object-cover transition group-hover:scale-105"
+                            />
+                            <div className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/85 to-transparent px-1.5 pb-1 pt-3 text-right">
+                              <p className="line-clamp-2 text-[10px] font-bold leading-tight text-white">
+                                {t.name}
+                              </p>
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          </>
+        )}
+      </AnimatePresence>
     </motion.div>
   );
 }
